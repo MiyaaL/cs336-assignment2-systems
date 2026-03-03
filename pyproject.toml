@@ -11,7 +11,7 @@ dependencies = [
     "numpy",
     "pytest>=8",
     "regex>=2024.11.6",
-    "torch~=2.5.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "torch~=2.9.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "tqdm>=4.67.1",
     "wandb>=0.19.7",
     "pandas>=2",
@@ -32,11 +32,11 @@ python-preference = "managed"
 
 [tool.uv.sources]
 cs336-basics = { path = "./cs336-basics", editable = true }  # Change this path to your assignment1-basics repo you want to use your own implementation!
-torch = { index = "pytorch-cu124" }
+torch = { index = "pytorch-cu130" }
 
 [[tool.uv.index]]
-name="pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name="pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 
