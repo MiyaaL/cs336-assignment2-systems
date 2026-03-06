@@ -8,7 +8,7 @@
 
 ### b
 
-测试详细数据见表，这里不详述。backward的耗时大约是forward的两倍，因为做了warm-up，测试时间波动不大
+测试详细数据见表，这里不详述。backward的耗时大约是forward的两倍（序列长度越大，backward耗时占比越大），因为做了warm-up，测试时间波动不大
 
 ### c
 
@@ -155,3 +155,24 @@ xl model: 4 * 128 * 1600 / 1024 / 1024 = 0.78125 MiB
 ### e
 
 主要是优化器的内存占用
+
+## 1.2.1 pytorch attention
+
+# a
+
+见附表，在 seq_len=16384 时会OOM。seq_len越大，backward 时的 memory 变化曲线会越陡峭，因为 activation 的 grad 会随着 backward 进行逐步释放，在 seq_len 较大时这部分显然是大头。
+
+![atten_backward_mem_prof](./atten_backward_mem_prof.png)
+
+可以做 KV_cache，把其放在 HBM/memory 而不是 GPU 显存上
+
+## 1.3
+
+### a
+
+compile 之后运行会更快一点，并且内存占用也会减少，具体见附表
+
+### b
+
+对于整个 model，compile 之后运行会更快一点
+
