@@ -1,6 +1,14 @@
 import torch
-import math
 from einops import einsum, rearrange
+
+
+def _apply_causal_mask(scores: torch.Tensor) -> torch.Tensor:
+    n_queries = scores.shape[-2]
+    n_keys = scores.shape[-1]
+    q_idx = torch.arange(n_queries, device=scores.device)[:, None]
+    k_idx = torch.arange(n_keys, device=scores.device)[None, :]
+    causal = q_idx >= k_idx
+    return torch.where(causal, scores, torch.full_like(scores, -1e6))
 
 
 def flash_bwd_recompute_impl(
@@ -13,10 +21,11 @@ def flash_bwd_recompute_impl(
     D: torch.Tensor,
     is_causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # recompute P
     d_q = q.shape[-1]
     scale = 1 / (d_q ** 0.5)
     s = einsum(q, k, "b i d, b j d -> b i j") * scale
+    if is_causal:
+        s = _apply_causal_mask(s)
     p = torch.exp(s - L.unsqueeze(-1))
 
     dv = einsum(p, do, "b i j, b i d -> b j d")
@@ -30,69 +39,42 @@ def flash_bwd_recompute_impl(
 class FlashAttentionTorch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
-        if (q.dim() < 3 or k.dim() < 3 or v.dim() < 3):
+        if q.dim() < 3 or k.dim() < 3 or v.dim() < 3:
             raise ValueError("q, k, and v must have shape (Batch, ..., D)")
-        if (q.shape != k.shape or q.shape != v.shape):
+        if q.shape != k.shape or q.shape != v.shape:
             raise ValueError("q, k, and v must have the same shape")
 
-        # tile size
-        B_q = 16
-        B_k = 16
-        # output shape
         merged_dims = q.shape[1:-1]
-        q = rearrange(q, "b ... d -> b (...) d")
-        k = rearrange(k, "b ... d -> b (...) d")
-        v = rearrange(v, "b ... d -> b (...) d")
-        # input size
-        batch_size, N_q, d_q = q.shape
-        _, N_k, d_k = k.shape
-        _, N_v, d_v = v.shape
+        q2 = rearrange(q, "b ... d -> b (...) d")
+        k2 = rearrange(k, "b ... d -> b (...) d")
+        v2 = rearrange(v, "b ... d -> b (...) d")
 
-        # output
-        o = torch.zeros(batch_size, N_q, d_q, device=q.device)
-        l = torch.zeros(batch_size, N_q, device=q.device)
+        d_q = q2.shape[-1]
+        scale = 1 / (d_q ** 0.5)
+        s = einsum(q2, k2, "b i d, b j d -> b i j") * scale
+        if is_causal:
+            s = _apply_causal_mask(s)
 
-        # get tile
-        T_q = N_q // B_q
-        T_k = N_k // B_k
-       
-        # for tiles in q
-        for i in range(T_q):
-            q_tile = q[:,i * B_q:(i + 1) * B_q, :]
-            o_prev = torch.zeros(batch_size, B_q, d_q, dtype=q.dtype, device=q.device)
-            m_prev = torch.ones(batch_size, B_q, dtype=q.dtype, device=q.device) * -float('inf')
-            l_prev = torch.zeros(batch_size, B_q, dtype=q.dtype, device=q.device)
-            for j in range(T_k):
-                k_tile = k[:, j * B_k:(j + 1) * B_k, :]
-                v_tile = v[:, j * B_k:(j + 1) * B_k, :]
+        p = torch.softmax(s, dim=-1)
+        o2 = einsum(p, v2, "b i j, b j d -> b i d")
+        l2 = torch.logsumexp(s, dim=-1)
 
-                s_j = einsum(q_tile, k_tile, "b i d, b j d -> b i j") / (d_q ** 0.5)
-                m_j = torch.maximum(m_prev, torch.max(s_j, dim=-1, keepdim=False)[0])
-                p_j = torch.exp(s_j - m_j.unsqueeze(-1).repeat(1, 1, B_k))
-                l_j = torch.exp(m_prev - m_j) * l_prev + torch.sum(p_j, dim=-1, keepdim=False)
-                o_j = torch.exp(m_prev - m_j).unsqueeze(-1) * o_prev + einsum(p_j, v_tile, "b i j, b j d -> b i d")
+        o = o2.view(q.shape)
+        l = l2.view(q.shape[0], *merged_dims)
 
-                m_prev = m_j
-                l_prev = l_j
-                o_prev = o_j
-        
-            o_i = o_j / l_j.unsqueeze(-1)
-            l_i = m_j + torch.log(l_j)
-            # fill output
-            o[:, i * B_q:(i + 1) * B_q, :] = o_i
-            l[:, i * B_q:(i + 1) * B_q] = l_i
-        
-        l = l.view(batch_size, *merged_dims)
-        o = o.view(batch_size, *merged_dims, d_q)
-
-        ctx.save_for_backward(q, k, v, o, l)
+        ctx.save_for_backward(q2, k2, v2, o2, l2)
         ctx.is_causal = is_causal
-
+        ctx.original_shape = q.shape
         return o
 
     @staticmethod
     def backward(ctx, do):
-        (q, k, v, o, L) = ctx.saved_tensors
-        D = torch.sum(o * do, dim=-1)
-        dq, dk, dv = flash_bwd_recompute_impl(q, k, v, o, do, L, D, ctx.is_causal)
+        q2, k2, v2, o2, l2 = ctx.saved_tensors
+        do2 = rearrange(do, "b ... d -> b (...) d")
+        D = torch.sum(o2 * do2, dim=-1)
+        dq2, dk2, dv2 = flash_bwd_recompute_impl(q2, k2, v2, o2, do2, l2, D, ctx.is_causal)
+        q_shape = ctx.original_shape
+        dq = dq2.view(q_shape)
+        dk = dk2.view(q_shape)
+        dv = dv2.view(q_shape)
         return dq, dk, dv, None
