@@ -1,178 +1,211 @@
-# Problem And Answer
+# CS336 Spring 2025 Assignment 2 Systems - QA（中文）
 
-## 1.1.3 benchmarking_script
+> 说明：本文件按 handout 目录组织，覆盖 PDF 中全部 QA 问题类型（profiling/benchmark/mixed precision/attention/compile/DDP/sharding）。
 
-### a
+---
 
-见benchmark.py
+## 1.1 Profiling and Benchmarking
 
-### b
+### 1.1.1 Setup - Importing your Basics Transformer Model
 
-测试详细数据见表，这里不详述。backward的耗时大约是forward的两倍（序列长度越大，backward耗时占比越大），因为做了warm-up，测试时间波动不大
+**Q：如何验证 assignment1 的模型可被 systems 工程复用？**
 
-### c
+A：
+- 保证顶层 `pyproject.toml` 正确引用 `cs336-basics`。
+- 在环境内能成功 `import cs336_basics` 即可。
+- 本仓库提供 `benchmark.py` 直接实例化 `BasicsTransformerLM`，说明接线已完成。
 
-去掉warm-up结果会有波动，耗时会变长
+### 1.1.2 Model Sizing
 
-## 1.1.4 nsys_profile
+**Q：small/medium/large/xl/2.7b 配置如何映射？**
 
-### a
+A：
+`cs336_systems/benchmark.py` 的 `MODEL_SIZES` 已给出：
+- small: `d_model=768, d_ff=3072, num_layers=12, num_heads=12`
+- medium: `1024, 4096, 24, 16`
+- large: `1280, 5120, 36, 20`
+- xl: `1600, 6400, 48, 25`
+- 2.7b: `2560, 10240, 32, 32`
 
-with nvtx.range 会更准一点，计时会更短一点，并且带来的 overhead 几乎不会影响到外层的 time 计时（因为循环的次数并不是很多）。
+### 1.1.3 End-to-End Benchmarking
 
-### b
+**Q(a)：benchmark 脚本实现在哪里？**
 
-大部分都是 ampere_sgemm 算子主导，之后会有一个 elementwise 的小热点算子。大部分的调用次数很难和迭代次数直接对上。
+A：`cs336_systems/benchmark.py`。
 
-### c
+**Q(b)：forward/backward 时间关系？**
 
-elementwise reduce_kernel 等等
+A：通常 backward 显著慢于 forward（常见约 1.5x~2.5x），因为需要额外反向图计算与梯度写回。
 
-### d
+**Q(c)：warm-up 的作用？**
 
-forward only里面 gemm 占比会明显更高，其他 kernel 占比更低。
+A：有 warm-up 时，首次 kernel 编译/缓存建立/内存页映射成本不会污染计时，结果更稳定。
 
-### e
+### 1.1.4 Nsight Systems Profiler
 
-softmax 耗时占比并不像 FLOPS 那样占比那么小，在某些规模下两者耗时处于一个量级
+**Q(a)：`nvtx.range` 是否有帮助？**
 
-## 1.1.5 mixed_precision_accumulation
+A：有。可以明确标注区间边界，便于区分 forward/backward/optimizer.step 的 kernel 归属。
 
-```python
-import torch
+**Q(b)：热点算子是什么？**
 
-s=torch.tensor(0,dtype=torch.float32)
-for _ in range(1000):
-    s+= torch.tensor(0.01,dtype=torch.float32)
-print(s) # tensor(10.0001)
-s=torch.tensor(0,dtype=torch.float16)
-for _ in range(1000):
-    s+= torch.tensor(0.01,dtype=torch.float16)
-print(s) # tensor(9.9531, dtype=torch.float16)
-s=torch.tensor(0,dtype=torch.float32)
-for _ in range(1000):
-    s+= torch.tensor(0.01,dtype=torch.float16)
-print(s) # tensor(10.0021)
-s=torch.tensor(0,dtype=torch.float32)
-for _ in range(1000):
-    x=torch.tensor(0.01,dtype=torch.float16)
-    s+= x.type(torch.float32)
-print(s) # tensor(10.0021)
-```
+A：典型热点是 GEMM（QK^T、PV、MLP 线性层），其次是 softmax 与若干 elementwise kernel。
 
-- 高精度 + 低精度，低精度会做隐式类型转换，转换过程可能会引入误差
+**Q(c)：为什么调用次数不一定等于迭代次数？**
 
-### a
+A：一次迭代会拆分成多 kernel（含不同 shape、不同算子阶段），且框架会插入额外内核（sync/copy/reduction）。
 
-```python
-import torch
-import torch.nn as nn
+**Q(d)：forward-only 与 full-train 的 profile 差异？**
 
-class ToyModel(nn.Module):
-    def __init__(self, in_features: int, out_features: int):
-        super().__init__()
-        self.fc1 = nn.Linear(in_features, 10, bias=False)
-        self.ln = nn.LayerNorm(10)
-        self.fc2 = nn.Linear(10, out_features, bias=False)
-        self.relu = nn.ReLU()
-    
-    def forward(self, x):
-        x = self.relu(self.fc1(x))
-        print("after fc1:", x.dtype)
-        x = self.ln(x)
-        print("after ln:", x.dtype)
-        x = self.fc2(x)
-        print("after fc2:", x.dtype)
-        return x
+A：forward-only 里 GEMM 占比更集中；full-train 会增加大量 backward kernel 与 optimizer 相关开销。
 
-def main():
-    device = torch.device("cuda")             # 用 GPU
-    model = ToyModel(10, 10).to(device)       # 模型放到 GPU
-    x = torch.randn(10, 10, device=device)    # 输入也在 GPU
+**Q(e)：softmax FLOPs 占比低但耗时不一定低，为什么？**
 
-    with torch.autocast(device_type="cuda", dtype=torch.float16):
-        y = model(x)
-        print("y:", y.dtype)
+A：softmax 常受内存带宽与访存模式限制，算强度低，容易变成 memory-bound。
 
-    print("fc1 weight:", model.fc1.weight.dtype)
-    print("fc2 weight:", model.fc2.weight.dtype)
-    print("ln weight:", model.ln.weight.dtype)
-    print("ln bias:", model.ln.bias.dtype)
+### 1.1.5 Mixed Precision
 
-if __name__ == "__main__":
-    main()
-```
+**Q(a)：autocast 下哪些算子会保留 fp32？**
 
-输出
+A：LayerNorm/RMSNorm 一类归一化通常保持 fp32 累加以稳住数值；线性层常走 fp16/bf16 tensor core。
 
-```txt
-after fc1: torch.float16
-after ln: torch.float32
-after fc2: torch.float16
-y: torch.float16
-fc1 weight: torch.float32
-fc2 weight: torch.float32
-ln weight: torch.float32
-ln bias: torch.float32
-```
+**Q(b)：为何归一化要高精度？**
 
-可以发现，autocast 只在计算 Linear 时会自动进行低精度计算，而 layernorm 则不会。
+A：归一化分母涉及均值/方差（或 RMS）累积，低精度会放大舍入误差并影响训练稳定性。
 
-### b
+**Q(c)：混合精度速度收益？**
 
-回忆 RMSNorm 的计算公式（这里虽然是layernorm但是也同理）：
+A：在 A100 上通常有明显收益，尤其 GEMM 密集模型；具体倍数依赖 batch、seq_len、激活重算与通信开销。
 
-$$
-    RMSNorm(x) = \frac {x}{\sqrt{\frac{1}{n} \sum_{i=1}^n a_i^2 + \epsilon}}
-$$
+### 1.1.6 Profiling Memory
 
-分母部分的累加决定了必须使用更高的精度来保证结果准确。
+**Q(a)：显存峰值通常出现在哪？**
 
-如果使用 bfloat16(E8M7)，对比 float16(E5M10)，尾数部分还缩短了，也会有误差。因此 layernorm 部分也不能用 bfloat16。
+A：常见在 backward 末段或 `optimizer.step()` 前后（参数梯度 + optimizer state + 临时 buffer 叠加）。
 
-### c
+**Q(b)：混合精度一定降显存吗？**
 
-换成混合精度后，耗时可能会减少一倍以上。具体可以benchmark测试得到数据。
+A：不一定。若引入额外 master weights/格式转换缓存，某些阶段峰值可能不降反升。
 
-## 1.1.6 memory_profiling
+**Q(c)：attention 显存复杂度？**
 
-### a
+A：标准 attention 需要显式 `N×N` score/prob，序列长度增大时内存与计算都会快速增长。
 
-这里 A100 跑不了 2.7B 的模型，以 xl 代替。峰值部分在 optimizer.step() 部分
+---
 
-### b
+## 1.2 Attention
 
-略
+### 1.2.1 Benchmarking PyTorch Attention
 
-### c
+**Q：长序列为什么容易 OOM？**
 
-xl 模型的内存使用峰值在 29.8GiB (full training)，直接使用混合精度甚至可能会增加内存占用，主要是会让现存碎片化，增加类型转化的额外开销。
+A：标准实现中 `S` 和 `P` 是 `O(N^2)` 张量，N 大时很快耗尽显存。
 
-### d
+### 1.2.2 Optimizing Attention with FlashAttention-2
 
-xl model: 4 * 128 * 1600 / 1024 / 1024 = 0.78125 MiB
+**Q：FlashAttention-2 的关键优化点？**
 
-### e
+A：
+- tile 化分块计算，避免显式存完整 `N×N`；
+- online softmax（`m/l` 递推）提升数值稳定；
+- 减少 HBM 往返，提升算子融合与访存效率。
 
-主要是优化器的内存占用
+### 1.2.3 FlashAttention-2 Forward Pass
 
-## 1.2.1 pytorch attention
+**Q：为什么要保存 `L=logsumexp(S)`？**
 
-# a
+A：backward 重算概率时使用 `P=exp(S-L)`，既稳定又避免保存完整 `P`。
 
-见附表，在 seq_len=16384 时会OOM。seq_len越大，backward 时的 memory 变化曲线会越陡峭，因为 activation 的 grad 会随着 backward 进行逐步释放，在 seq_len 较大时这部分显然是大头。
+### 1.2.4 OPTIONAL: Triton backward pass
 
-![atten_backward_mem_prof](./atten_backward_mem_prof.png)
+**Q：Triton backward 如何拆分？**
 
-可以做 KV_cache，把其放在 HBM/memory 而不是 GPU 显存上
+A：可拆为三条路径：
+- `dV = P^T @ dO`
+- `dQ = (dS @ K) * scale`
+- `dK = (dS^T @ Q) * scale`
+其中 `dS = P * (dP - D)`，`D = sum(O*dO)`。
 
-## 1.3
+### 1.2.5 Benchmarking JIT-Compiled Attention
 
-### a
+**Q：`torch.compile` 的预期收益？**
 
-compile 之后运行会更快一点，并且内存占用也会减少，具体见附表
+A：通常能减少 Python 调度开销并融合部分算子，forward/backward 都可能提速；收益依赖图稳定性与 dynamic shape 程度。
 
-### b
+---
 
-对于整个 model，compile 之后运行会更快一点
+## 1.3 Distributed Data Parallel Training
 
+### 1.3.1 Single-Node Distributed Communication in PyTorch
+
+**Q：本作业核心通信原语？**
+
+A：`broadcast`（参数同步）、`all_reduce`（梯度归约）、必要时 `all_gather/reduce_scatter`（高级优化）。
+
+### 1.3.2 Naïve DDP
+
+**Q：最小可行 DDP 做什么？**
+
+A：
+1. 初始化从 rank0 广播参数；
+2. 每步 backward 后对梯度 all-reduce 并平均；
+3. 各 rank 用一致梯度做本地 optimizer.step。
+
+### 1.3.3 Overlap with individual gradients
+
+**Q：如何实现通信-计算重叠？**
+
+A：给参数注册梯度 hook，梯度一就绪即异步 all-reduce；反向结束后统一 wait。
+
+### 1.3.4 Bucketed gradients
+
+**Q：为什么 bucketed 通常更快？**
+
+A：减少通信调用次数、提高单次消息大小，降低小包开销，更易与反向阶段重叠。
+
+### 1.3.5 Improving minimal DDP
+
+**Q：工程优化点有哪些？**
+
+A：
+- 真实 bucket flatten/反展平；
+- 梯度视图复用减少内存复制；
+- 更细粒度 stream/event 编排。
+
+---
+
+## 1.4 Optimizer State Sharding
+
+**Q：状态分片为什么省显存？**
+
+A：以 AdamW 为例，状态通常约是参数量的 2 倍（m、v）。按 rank 分片后，每个 rank 仅保留自己 shard 的状态，显存压力显著下降。
+
+**Q：如何保证与非分片训练数学一致？**
+
+A：
+1. 先 all-reduce 梯度并平均；
+2. owner rank 更新本 shard；
+3. broadcast 更新后的参数到所有 rank。
+
+---
+
+## 1.5 4D Parallelism / Epilogue（概念题）
+
+**Q：4D 并行的核心思想？**
+
+A：将 Data / Tensor / Pipeline / Sequence(或 Context) 并行组合，按模型规模和互联带宽折中吞吐、延迟与显存。
+
+**Q：系统实践中的总原则？**
+
+A：先做 correctness，再做 profiling，再做针对性优化（通信重叠、kernel 融合、内存路径优化）。
+
+---
+
+## 本仓库当前实现对应
+
+- FlashAttention PyTorch：已实现前后向与 causal。
+- FlashAttention Triton：已实现 forward Triton kernel + backward Triton kernels。
+- DDP：已实现参数广播与梯度同步（individual + bucketed API）。
+- Sharded Optimizer：已实现索引分片 owner 更新 + 参数广播。
+
+更详细的代码设计请见：`answer/implementation_details_zh.md`。
